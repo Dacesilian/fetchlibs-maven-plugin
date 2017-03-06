@@ -90,6 +90,9 @@ public class FetchlibsMojo extends AbstractMojo {
 	@Parameter(property = "fetchlibs.startClassToFile", defaultValue = "")
 	private String startClassToFile;
 
+	@Parameter
+	private List<Exclusion> exclusions;
+
 	private CollectRequest theCollectRequest = null;
 	private Settings effectiveSettings;
 
@@ -214,6 +217,8 @@ public class FetchlibsMojo extends AbstractMojo {
 			}
 
 			getLog().info("");
+			listExclusions();
+			getLog().info("");
 			// Prepare libraries
 			i = 1;
 			for (MavenDependency d : list) {
@@ -288,14 +293,17 @@ public class FetchlibsMojo extends AbstractMojo {
 		try {
 			DependencyResult theDependencyResult = repositorySystem.resolveDependencies(repositorySystemSession, theDependencyRequest);
 			for (ArtifactResult theArtifactResult : theDependencyResult.getArtifactResults()) {
-				Artifact theResolved = theArtifactResult.getArtifact();
-				// Now we have the artifact file locally stored available
-				// and we can do something with it
-				File depFile = theResolved.getFile();
+				Artifact resolved = theArtifactResult.getArtifact();
+				if (isInExclusions(resolved)) {
+					getLog().info("   Not including excluded dependency");
+					continue;
+				}
+
+				File depFile = resolved.getFile();
 				getLog().debug("   File stored in " + depFile.getAbsolutePath());
 
 				if (!depFile.getParentFile().equals(dir)) {
-					File targetFile = new File(dir.getAbsolutePath() + File.separator + depFile.getName());
+					File targetFile = new File(dir.getAbsolutePath() + File.separator + resolved.getGroupId().replace('.', '-') + "-" + depFile.getName());
 					if (!targetFile.exists()) {
 						FileUtils.copyFile(depFile, targetFile);
 						getLog().info("   [COPYING] File to " + targetFile.getAbsolutePath() + " from " + depFile.getAbsolutePath());
@@ -304,7 +312,7 @@ public class FetchlibsMojo extends AbstractMojo {
 						FileUtils.copyFile(depFile, targetFile);
 						getLog().info("   [REPLACING] File " + targetFile.getAbsolutePath() + " from " + depFile.getAbsolutePath() + " (differs in length - " + targetFile.length() + " vs " + depFile.length() + ")");
 					} else {
-						getLog().info("   [OK] File already stored in " + depFile.getAbsolutePath());
+						getLog().info("   [OK] File already stored in " + targetFile.getAbsolutePath());
 					}
 				}
 			}
@@ -313,6 +321,28 @@ public class FetchlibsMojo extends AbstractMojo {
 			throw new MojoExecutionException("Error while resolving dependency", e);
 		}
 		getLog().info("");
+	}
+
+	private void listExclusions() {
+		if (exclusions != null && exclusions.size() >= 1) {
+			getLog().info("There are " + exclusions.size() + " exclusions:");
+			for (Exclusion e : exclusions) {
+				getLog().info("   " + e.getGroupId() + ":" + e.getArtifactId());
+			}
+		} else {
+			getLog().info("There are no exclusions.");
+		}
+	}
+
+	private boolean isInExclusions(Artifact artifact) {
+		if (exclusions != null && exclusions.size() >= 1) {
+			for (Exclusion e : exclusions) {
+				if (e.getGroupId().equalsIgnoreCase(artifact.getGroupId()) && e.getArtifactId().equalsIgnoreCase(artifact.getArtifactId())) {
+					return true;
+				}
+			}
+		}
+		return false;
 	}
 
 	private void addAllRepositories(MavenProject proj) {
