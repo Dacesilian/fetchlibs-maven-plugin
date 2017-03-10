@@ -6,8 +6,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Enumeration;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -93,7 +95,15 @@ public class FetchlibsMojo extends AbstractMojo {
 	@Parameter
 	private List<Exclusion> exclusions;
 
-	private CollectRequest theCollectRequest = null;
+	@Parameter
+	private List<SpecificRepository> specificRepositories;
+
+	@Parameter
+	private List<ExcludedRepository> excludedRepositories;
+
+	private CollectRequest globalCollectRequest = null;
+	private Map<Pattern, CollectRequest> specificCollectRequests = new HashMap<Pattern, CollectRequest>();
+
 	private Settings effectiveSettings;
 
 	public static final String userHome = System.getProperty("user.home");
@@ -253,9 +263,10 @@ public class FetchlibsMojo extends AbstractMojo {
 		prepareRemoteReposCollection();
 
 		// 1 - Fetch POM and parse repositories from it
-		theCollectRequest.setRoot(new org.eclipse.aether.graph.Dependency(new DefaultArtifact(d.getGroupId(), d.getArtifactId(), "pom", d.getVersion()), d.getScope()));
 		DependencyFilter pomFilter = new PatternInclusionsDependencyFilter(depPatternPom);
-		DependencyRequest theDependencyRequest = new DependencyRequest(theCollectRequest, DependencyFilterUtils.andFilter(pomFilter, NOT_OPTIONAL_FILTER));
+
+		globalCollectRequest.setRoot(new org.eclipse.aether.graph.Dependency(new DefaultArtifact(d.getGroupId(), d.getArtifactId(), "pom", d.getVersion()), d.getScope()));
+		DependencyRequest theDependencyRequest = new DependencyRequest(globalCollectRequest, DependencyFilterUtils.andFilter(pomFilter, NOT_OPTIONAL_FILTER));
 		try {
 			DependencyResult theDependencyResult = repositorySystem.resolveDependencies(repositorySystemSession, theDependencyRequest);
 			for (ArtifactResult theArtifactResult : theDependencyResult.getArtifactResults()) {
@@ -287,9 +298,34 @@ public class FetchlibsMojo extends AbstractMojo {
 		prepareRemoteReposCollection();
 
 		// 2 - Fetch actual dependency
-		theCollectRequest.setRoot(new org.eclipse.aether.graph.Dependency(new DefaultArtifact(d.getGroupId(), d.getArtifactId(), d.getPackaging(), d.getVersion()), d.getScope()));
 		DependencyFilter patternFilter = new PatternInclusionsDependencyFilter(depPatternDef);
-		DependencyRequest theDependencyRequest = new DependencyRequest(theCollectRequest, DependencyFilterUtils.andFilter(RUNTIME_FILTER, patternFilter, NOT_OPTIONAL_FILTER));
+
+		DependencyRequest theDependencyRequest = null;
+		if (specificCollectRequests != null && specificCollectRequests.size() >= 1) {
+			boolean matches = false;
+			for (Pattern p : specificCollectRequests.keySet()) {
+				Matcher m = p.matcher(d.getGroupId());
+				if (m.matches()) {
+					CollectRequest coll = specificCollectRequests.get(p);
+					if (coll != null) {
+						matches = true;
+						coll.setRoot(new org.eclipse.aether.graph.Dependency(new DefaultArtifact(d.getGroupId(), d.getArtifactId(), d.getPackaging(), d.getVersion()), d.getScope()));
+						theDependencyRequest = new DependencyRequest(coll, DependencyFilterUtils.andFilter(RUNTIME_FILTER, patternFilter, NOT_OPTIONAL_FILTER));
+						getLog().info("           Using specific repository for " + d.getGroupId() + ":" + d.getArtifactId());
+					} else {
+						getLog().error("Specific repository for " + d.getGroupId() + ":" + d.getArtifactId() + " has NULL CollectRequest");
+					}
+				}
+			}
+			if (!matches) {
+				globalCollectRequest.setRoot(new org.eclipse.aether.graph.Dependency(new DefaultArtifact(d.getGroupId(), d.getArtifactId(), d.getPackaging(), d.getVersion()), d.getScope()));
+				theDependencyRequest = new DependencyRequest(globalCollectRequest, DependencyFilterUtils.andFilter(RUNTIME_FILTER, patternFilter, NOT_OPTIONAL_FILTER));
+			}
+		} else {
+			globalCollectRequest.setRoot(new org.eclipse.aether.graph.Dependency(new DefaultArtifact(d.getGroupId(), d.getArtifactId(), d.getPackaging(), d.getVersion()), d.getScope()));
+			theDependencyRequest = new DependencyRequest(globalCollectRequest, DependencyFilterUtils.andFilter(RUNTIME_FILTER, patternFilter, NOT_OPTIONAL_FILTER));
+		}
+
 		try {
 			DependencyResult theDependencyResult = repositorySystem.resolveDependencies(repositorySystemSession, theDependencyRequest);
 			for (ArtifactResult theArtifactResult : theDependencyResult.getArtifactResults()) {
@@ -347,7 +383,7 @@ public class FetchlibsMojo extends AbstractMojo {
 
 	private void addAllRepositories(MavenProject proj) {
 		if (proj != null) {
-			for (Repository repo : proj.getRepositories()) {
+			repos: for (Repository repo : proj.getRepositories()) {
 				if (repos.add(repo.getUrl())) {
 					Builder builder = new RemoteRepository.Builder(repo.getId(), "default", repo.getUrl());
 					Server server = getServerFromSettings(repo.getId());
@@ -355,10 +391,39 @@ public class FetchlibsMojo extends AbstractMojo {
 						builder.setAuthentication(new AuthenticationBuilder().addUsername(server.getUsername()).addPassword(server.getPassword()).build());
 					}
 					RemoteRepository remoteRepo = builder.build();
-					getLog().info("[REPOSITORY] Adding repository " + remoteRepo.getUrl() + " (ID " + remoteRepo.getId() + ") found in some POM");
-					theCollectRequest.addRepository(remoteRepo);
+
+					if (excludedRepositories != null) {
+						for (ExcludedRepository e : excludedRepositories) {
+							if (remoteRepo.getUrl().matches(e.getUrl())) {
+								getLog().info("[ExcludedRepo] Skipping repository " + remoteRepo.getUrl() + " (ID " + remoteRepo.getId() + ") - is excluded by URL");
+								continue repos;
+							}
+						}
+					}
+
+					getLog().info("[REPOSITORY] Adding repository " + remoteRepo.getUrl() + " (ID " + remoteRepo.getId() + ") found in POM " + proj.getGroupId() + ":" + proj.getArtifactId());
+
+					boolean isSpecific = false;
+					if (specificRepositories != null) {
+						for (SpecificRepository r : specificRepositories) {
+							if (r.getRepositoryId().equalsIgnoreCase(remoteRepo.getId())) {
+								isSpecific = true;
+								Pattern p = Pattern.compile(r.getGroupId());
+								CollectRequest req = new CollectRequest();
+								req.addRepository(remoteRepo);
+								this.specificCollectRequests.put(p, req);
+								getLog().info("             Repository is specific to groupId pattern " + r.getGroupId());
+								break;
+							}
+						}
+					}
+
+					if (!isSpecific) {
+						globalCollectRequest.addRepository(remoteRepo);
+					}
+
 					if (server != null) {
-						getLog().info("   [AUTH] Setting repository " + repo.getId() + " authentication username " + server.getUsername() + " from settings");
+						getLog().info("      [AUTH] Setting repository " + repo.getId() + " authentication username " + server.getUsername() + " from settings");
 					}
 				}
 			}
@@ -398,11 +463,11 @@ public class FetchlibsMojo extends AbstractMojo {
 	}
 
 	private void prepareRemoteReposCollection() {
-		if (theCollectRequest == null) {
-			theCollectRequest = new CollectRequest();
+		if (globalCollectRequest == null) {
+			globalCollectRequest = new CollectRequest();
 			for (RemoteRepository theRepository : remoteRepositories) {
-				getLog().info("Adding remote repository " + theRepository.getUrl());
-				theCollectRequest.addRepository(theRepository);
+				getLog().info("Adding remote repository ID " + theRepository.getId() + " - " + theRepository.getUrl());
+				globalCollectRequest.addRepository(theRepository);
 			}
 		}
 	}
